@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from prefilter import canonical_name, load_rules, load_tier_rows
+from filters.prefilter import canonical_name, load_rules, load_tier_rows
 from prompt.creator import (
     CREATOR_RETRY_TEMPLATE,
     CREATOR_SYSTEM_PROMPT,
@@ -30,7 +30,7 @@ USER_INPUT_CONSTRUCTION = (
 
 
 def load_cards(path: str | None = None) -> list[dict]:
-    from prefilter import CARDS_JSON
+    from filters.prefilter import CARDS_JSON
 
     with open(path or CARDS_JSON, encoding="utf-8") as f:
         return json.load(f)

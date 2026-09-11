@@ -50,7 +50,7 @@ def _benefit_phrase(b: int, conf: str) -> str:
 
 def _creator_stub(card: dict) -> str:
     """Детерминированный черновик PUSH/CARD (замена — LLM через call_creator)."""
-    from prefilter import canonical_name
+    from filters.prefilter import canonical_name
 
     d = card["decision"]
     canonical = canonical_name(d["offer_id"])
@@ -124,7 +124,7 @@ def _validator_stub(card: dict, push: str, card_text: str) -> str:
 
     tnorm = _norm(text)
     facts: list[bool] = []
-    from prefilter import canonical_name
+    from filters.prefilter import canonical_name
 
     canonical = canonical_name(card["decision"]["offer_id"])
     facts.append(_norm(canonical) in tnorm)

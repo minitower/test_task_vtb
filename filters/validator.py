@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from prefilter import load_rules, load_tier_rank, normalize_numbers
+from filters.prefilter import load_rules, load_tier_rank, normalize_numbers
 
 
 @dataclass
@@ -222,7 +222,7 @@ def llm_validate(card: dict, push: str, card_text: str, system_prompt: str, user
     return chat_completion(system_prompt, user_prompt)
     ```
     """
-    from llm_client import _validator_stub
+    from common.llm_client import _validator_stub
 
     return _validator_stub(card, push, card_text)
 
@@ -259,7 +259,7 @@ def _item_from_llm(code: str, blocking: bool, data: dict) -> ItemResult:
 
 def run_validator(card: dict, push: str, card_text: str) -> ValidatorResult:
     """Запускает Python + LLM валидатор (spec/03)."""
-    from prompt_assembly import build_validator_prompts
+    from common.prompt_assembly import build_validator_prompts
 
     result = ValidatorResult()
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from prefilter import INJECTION_PATTERNS, load_rules
+from filters.prefilter import INJECTION_PATTERNS, load_rules
 
 PUSH_MAX = 70
 CARD_MAX = 350
