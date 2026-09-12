@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
-from filters.postprocessing import disclaimer_of, run_postprocessing
+import json
+
+from filters.postprocessing import PostResult, disclaimer_of, run_postprocessing
 
 OFFER = "CASH-CAT-011"
 DISCLAIMER = "«Кэшбэк начисляется по правилам программы. Лимиты — в приложении.»"
@@ -86,3 +88,31 @@ def test_ordinary_text_with_no_issues_passes_clean():
     assert res.ok
     assert res.push == "Кэшбэк около 280 ₽/мес"
     assert res.card.endswith(DISCLAIMER)
+
+
+def test_postprocess_node_failure_populates_review_for_retry(monkeypatch, stub_llm_boundary, cards_by_ref):
+    """Регрессия: `_n_postprocess` обязан класть провал в `failed_items`,
+    как это делают format_check/validator_node, иначе `retry_gate`
+    отправляет creator'у пустой review (нарушение CLAUDE.md/spec/00 —
+    "после первой попытки creator получает ревью упавших пунктов")."""
+    import agent
+
+    calls = {"n": 0}
+
+    def fake_run_postprocessing(push, card_text, offer_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return PostResult(False, push, card_text, "D1: дисклеймер не найден посимвольно")
+        return PostResult(True, push.strip(), card_text + "\n" + disclaimer_of(offer_id))
+
+    monkeypatch.setattr(agent, "run_postprocessing", fake_run_postprocessing)
+
+    state = agent.run_card(cards_by_ref["c-8f21"])
+
+    retry_events = [
+        json.loads(line) for line in state["log"] if json.loads(line).get("stage") == "retry"
+    ]
+    assert retry_events, "не было retry-события после провала постобработки"
+    assert retry_events[0]["reason"] == "POSTPROCESS"
+    assert retry_events[0]["codes"] == ["POSTPROCESS"]
+    assert state["status"] == "ACCEPT"

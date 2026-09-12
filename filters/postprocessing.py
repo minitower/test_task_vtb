@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-
-from filters.prefilter import load_rules
+from filters.prefilter import disclaimer_of
 from filters.format_control import CARD_MAX, PUSH_MAX
 
 
@@ -19,12 +18,6 @@ class PostResult:
     push: str = ""
     card: str = ""
     failure: str = ""
-
-
-def disclaimer_of(offer_id: str) -> str:
-    rules = load_rules()
-    key = next(k for k in rules[offer_id] if k.lower().startswith("обязательный"))
-    return rules[offer_id][key]
 
 
 # Служебные поля, которые не могут попасть в финальный текст (spec/04 §2).
@@ -44,7 +37,7 @@ def run_postprocessing(push: str, card_text: str, offer_id: str) -> PostResult:
     disclaimer = disclaimer_of(offer_id)
     if disclaimer in text:
         # Idempotent-вставка: дисклеймер уже есть (дубль не должен пройтись
-        # формат-контроль, но на всякий случай не дублируем) — лог-event.
+        # формат-контроль, но на всякий случай не дублируем).
         final = text
     else:
         final = text + "\n" + disclaimer

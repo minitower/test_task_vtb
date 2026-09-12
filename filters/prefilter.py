@@ -11,12 +11,13 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
+
+import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RULES_CSV = DATA_DIR / "rules.csv"
@@ -79,22 +80,42 @@ _TIER_ROWS: dict[str, dict[str, str]] | None = None
 _TIER_RANK: dict[str, int] | None = None
 
 
+def _read_csv_lenient(path: Path) -> pd.DataFrame:
+    """Читает CSV через pandas без строгого парсинга заголовков: все значения
+    остаются строками (никакого приведения к NaN/числам — «-» и т.п. должны
+    доходить как есть), а названия столбцов лишь очищаются от лишних
+    пробелов, без требования точного совпадения строк заголовка."""
+    df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
+    df.columns = df.columns.str.strip()
+    return df
+
+
+def _find_column(columns: list[str], predicate: Callable[[str], bool]) -> str:
+    """Нестрогий поиск столбца по предикату над нормализованным (нижний
+    регистр, без пробелов по краям) названием — терпим к регистру/пробелам
+    в заголовке CSV."""
+    for col in columns:
+        if predicate(col.strip().lower()):
+            return col
+    raise KeyError(f"не найден столбец среди {columns!r}")
+
+
 def _load_rules() -> dict[str, dict[str, str]]:
     global _RULES
     if _RULES is None:
-        with open(RULES_CSV, newline="", encoding="utf-8") as f:
-            _RULES = {row["offer_id"]: row for row in csv.DictReader(f)}
+        df = _read_csv_lenient(RULES_CSV)
+        offer_col = _find_column(list(df.columns), lambda c: "offer_id" in c)
+        _RULES = {row[offer_col]: row for row in df.to_dict(orient="records")}
     return _RULES
 
 
 def _load_tier_rows() -> dict[str, dict[str, str]]:
     global _TIER_ROWS, _TIER_RANK
     if _TIER_ROWS is None:
-        with open(LOYALTY_CSV, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            key = reader.fieldnames[0]
-            _TIER_ROWS = {row[key]: row for row in reader}
-            _TIER_RANK = {tier: i for i, tier in enumerate(_TIER_ROWS)}
+        df = _read_csv_lenient(LOYALTY_CSV)
+        key = df.columns[0]  # первый столбец — уровень, независимо от заголовка
+        _TIER_ROWS = {row[key]: row for row in df.to_dict(orient="records")}
+        _TIER_RANK = {tier: i for i, tier in enumerate(_TIER_ROWS)}
     return _TIER_ROWS
 
 
@@ -106,6 +127,15 @@ def canonical_name(offer_id: str) -> str:
     """Каноническое название из rules.csv по offer_id."""
     rules = _load_rules()
     key = next(k for k in rules[offer_id] if "назв" in k.lower())
+    return rules[offer_id][key]
+
+
+def disclaimer_of(offer_id: str) -> str:
+    """Обязательный дисклеймер из rules.csv по offer_id (spec/04) — единственное
+    место, где ищется этот столбец; format_control и postprocessing не
+    дублируют поиск, чтобы не разойтись при изменении заголовка в rules.csv."""
+    rules = _load_rules()
+    key = next(k for k in rules[offer_id] if k.lower().startswith("обязательный"))
     return rules[offer_id][key]
 
 

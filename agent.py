@@ -39,10 +39,20 @@ def _dur_ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000, 3)
 
 
+def _say(state: "PipelineState", msg: str) -> None:
+    """Живой прогресс в консоль по ходу выполнения (не лог spec/07 — тот
+    остаётся структурным JSON в state['log']). Включается через
+    verbose=True в run_card/run_all — без него ничего не печатает, чтобы
+    не шуметь в тестах, которые вызывают run_card напрямую."""
+    if state.get("verbose"):
+        print(msg, flush=True)
+
+
 class PipelineState(TypedDict, total=False):
     client_ref: str
     card: dict
     variant: str
+    verbose: bool
     attempt: int
     prior_attempt: str
     review: list
@@ -63,6 +73,7 @@ class PipelineState(TypedDict, total=False):
 def _n_prefilter(state: PipelineState) -> dict:
     card = state["card"]
     client_ref = state["client_ref"]
+    _say(state, f"\n=== Карточка {client_ref} ===")
     t0 = time.perf_counter()
     res = run_prefilter(card)
     dur = _dur_ms(t0)
@@ -74,6 +85,7 @@ def _n_prefilter(state: PipelineState) -> dict:
     ]
     if not res.ok:
         # Это штатное решение, не ошибка входа (spec/01 §4): в логе отдельно.
+        _say(state, f"[1] Входные фильтры: REJECT_INPUT ({res.reason}) — {res.detail}")
         log = log + [
             make_event(
                 "final", client_ref, 1,
@@ -82,6 +94,14 @@ def _n_prefilter(state: PipelineState) -> dict:
             )
         ]
         return {"status": "REJECT_INPUT", "log": log}
+    d = card["decision"]
+    _say(
+        state,
+        f"[1] Входные фильтры пройдены. Ожидаемый результат: оффер {d['offer_id']}, "
+        f"выгода {d['benefit_month_rub']} ₽/мес ({d['benefit_confidence']}), "
+        f"условий: {len(d['conditions'])}, уровень {card['loyalty']['current_tier']}"
+        f" → {card['loyalty']['target_tier']}",
+    )
     return {
         "attempt": 1,
         "review": [],
@@ -108,6 +128,7 @@ def _n_creator(state: PipelineState) -> dict:
         card, attempt, state.get("prior_attempt"), state.get("review"),
         variant=variant,
     )
+    _say(state, f"[{attempt}] Формирование промпта завершено, отправка в LLM (creator, variant={variant})...")
     t0 = time.perf_counter()
     try:
         response = call_creator(card, system, user, variant=variant)
@@ -115,6 +136,7 @@ def _n_creator(state: PipelineState) -> dict:
         # Сбой LLM (spec/00): не чиним — идём в retry_gate тем же путём,
         # что и провал формат-контроля/валидатора.
         dur = _dur_ms(t0)
+        _say(state, f"[{attempt}] Сбой LLM за {dur:.0f} мс: {exc}")
         log = list(state.get("log", [])) + [
             make_event(
                 "creator_llm", client_ref, attempt,
@@ -130,6 +152,7 @@ def _n_creator(state: PipelineState) -> dict:
             "total_dur_ms": total_dur + dur,
         }
     dur = _dur_ms(t0)
+    _say(state, f"[{attempt}] LLM ответил за {dur:.0f} мс ({len(response)} символов)")
     log = list(state.get("log", [])) + [
         make_event(
             "creator_llm", client_ref, attempt,
@@ -168,11 +191,13 @@ def _n_format_check(state: PipelineState) -> dict:
         )
     ]
     if not res.ok:
+        _say(state, f"[{attempt}] Формат-контроль: FAIL — {res.violation}")
         return {
             "failed_items": [{"code": "FORMAT", "blocking": True, "reason": res.violation}],
             "log": log,
             "total_dur_ms": total_dur,
         }
+    _say(state, f"[{attempt}] Формат-контроль: OK")
     return {"push": res.push, "card_text": res.card, "log": log, "total_dur_ms": total_dur}
 
 
@@ -215,6 +240,11 @@ def _n_validator_node(state: PipelineState) -> dict:
             verdict=("PASS" if result.pass_ else "FAIL"),
         ),
     ]
+    if result.pass_:
+        _say(state, f"[{attempt}] Validator: PASS")
+    else:
+        codes = ", ".join(f["code"] for f in result.failures())
+        _say(state, f"[{attempt}] Validator: FAIL — {codes}")
     return {
         "validation": {"pass": result.pass_, "items": result.items, "failures": result.failures()},
         "failed_items": result.failures(),
@@ -242,8 +272,17 @@ def _n_postprocess(state: PipelineState) -> dict:
             ok=res.ok, failure=(res.failure if not res.ok else ""), dur_ms=dur,
         )
     ]
+    if res.ok:
+        _say(state, f"[{attempt}] Постобработка: OK")
+        return {
+            "post": {"ok": True, "push": res.push, "card": res.card, "failure": ""},
+            "log": log,
+            "total_dur_ms": total_dur,
+        }
+    _say(state, f"[{attempt}] Постобработка: FAIL — {res.failure}")
     return {
-        "post": {"ok": res.ok, "push": res.push, "card": res.card, "failure": res.failure},
+        "post": {"ok": False, "push": res.push, "card": res.card, "failure": res.failure},
+        "failed_items": [{"code": "POSTPROCESS", "blocking": True, "reason": res.failure}],
         "log": log,
         "total_dur_ms": total_dur,
     }
@@ -263,6 +302,7 @@ def _n_accept(state: PipelineState) -> dict:
             push_len=len(p["push"]), card_len=len(p["card"]),
         )
     ]
+    _say(state, f"[{attempt}] ACCEPT ✔\n    PUSH: {p['push']}\n    CARD: {p['card']}")
     return {"final_push": p["push"], "final_card": p["card"], "status": "ACCEPT", "log": log}
 
 
@@ -281,7 +321,9 @@ def _n_retry_gate(state: PipelineState) -> dict:
         make_event("retry", client_ref, next_attempt, reason=reason, codes=codes, dur_ms=0)
     ]
     if attempt >= MAX_ATTEMPTS:
+        _say(state, f"[{attempt}] Попытки исчерпаны ({MAX_ATTEMPTS}) — REJECT_VALIDATION")
         return {"status": "REJECT_VALIDATION", "log": log}
+    _say(state, f"[{attempt}] Попытка провалена ({reason}) → retry, попытка {attempt + 1}")
     return {
         "attempt": attempt + 1,
         "prior_attempt": state.get("creator_response", ""),
@@ -341,21 +383,30 @@ def run_card(
     client_ref: str | None = None,
     cards: list[dict] | None = None,
     variant: str = "default",
+    verbose: bool = False,
 ) -> dict:
     """Прогнать одну карточку (или по client_ref из cards.json) через pipeline.
 
     `variant` выбирает набор промптов creator'а (common/prompt_assembly.py,
     "default" или "creative") — validator и порог прохода не меняются.
+    `verbose=True` печатает живой прогресс по шагам (см. `_say`) вместо
+    молчаливого ожидания финального состояния — полезно для CLI-прогона,
+    где иначе не видно ничего до конца всей карточки (несколько LLM-вызовов
+    подряд на retry). По умолчанию выключено, чтобы не шуметь при вызове
+    из тестов/кода.
     """
     if card is None:
         cards = cards or load_cards()
         card = get_card_by_ref(cards, client_ref)
-    state = {"client_ref": card["client_ref"], "card": card, "variant": variant, "log": []}
+    state = {
+        "client_ref": card["client_ref"], "card": card, "variant": variant,
+        "verbose": verbose, "log": [],
+    }
     return PIPELINE.invoke(state)
 
 
-def run_all(variant: str = "default") -> dict[str, dict]:
-    return {c["client_ref"]: run_card(c, variant=variant) for c in load_cards()}
+def run_all(variant: str = "default", verbose: bool = False) -> dict[str, dict]:
+    return {c["client_ref"]: run_card(c, variant=variant, verbose=verbose) for c in load_cards()}
 
 
 def _json_default(obj: Any) -> Any:
@@ -411,20 +462,49 @@ if __name__ == "__main__":
 
     # --variant creative (в любом месте argv) → creator берёт другой набор
     # промптов (common/prompt_assembly.py); validator и порог те же.
+    # --quiet отключает живой построчный прогресс (см. _say) — по
+    # умолчанию он включён, иначе при нескольких карточках/retry не видно
+    # вообще ничего, пока не завершится весь прогон.
     argv = sys.argv[1:]
     variant = "default"
     if "--variant" in argv:
         i = argv.index("--variant")
         variant = argv[i + 1]
         del argv[i:i + 2]
+    verbose = "--quiet" not in argv
+    if not verbose:
+        argv.remove("--quiet")
+
+    # --print-prompt <client_ref> [--attempt N] — не гоняет pipeline и не
+    # трогает LLM, просто печатает итоговый system+user промпт creator'а
+    # для конкретной карточки (common/prompt_assembly.build_creator_prompts),
+    # ровно то, что реально уйдёт в модель — удобно для ручной проверки.
+    if "--print-prompt" in argv:
+        argv.remove("--print-prompt")
+        attempt = 1
+        if "--attempt" in argv:
+            i = argv.index("--attempt")
+            attempt = int(argv[i + 1])
+            del argv[i:i + 2]
+        if not argv:
+            print("Использование: agent.py <client_ref> --print-prompt [--attempt N] [--variant creative]")
+            sys.exit(1)
+        client_ref = argv[0]
+        card = get_card_by_ref(load_cards(), client_ref)
+        system, user = build_creator_prompts(card, attempt, variant=variant)
+        print(f"=== SYSTEM (variant={variant}) ===\n")
+        print(system)
+        print(f"\n=== USER (attempt {attempt}) ===\n")
+        print(user)
+        sys.exit(0)
 
     # Один client_ref позиционным аргументом → быстрый прогон одной
     # карточки для отладки (не трогает data/log*.json и data/results*.md,
     # печатает и текст ответа).
     if argv:
         client_ref = argv[0]
-        st = run_card(client_ref=client_ref, variant=variant)
-        print(f"{client_ref} -> {st.get('status')}")
+        st = run_card(client_ref=client_ref, variant=variant, verbose=verbose)
+        print(f"\n{client_ref} -> {st.get('status')}")
         for line in st.get("log", []):
             print("   " + line)
         if st.get("status") == "ACCEPT":
@@ -432,11 +512,10 @@ if __name__ == "__main__":
             print("CARD:", st.get("final_card"))
         sys.exit(0)
 
-    results = run_all(variant=variant)
+    results = run_all(variant=variant, verbose=verbose)
+    print("\n--- Итог ---")
     for ref, st in results.items():
         print(f"{ref} -> {st.get('status')}")
-        for line in st.get("log", []):
-            print("   " + line)
 
     suffix = "" if variant == "default" else f"_{variant}"
     log_json = LOG_JSON.with_stem(LOG_JSON.stem + suffix)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from filters.prefilter import INJECTION_PATTERNS, load_rules
+from filters.prefilter import INJECTION_PATTERNS, disclaimer_of
 
 PUSH_MAX = 70
 CARD_MAX = 350
@@ -30,12 +30,6 @@ class FormatResult:
     push: str = ""
     card: str = ""
     violation: str = ""
-
-
-def _disclaimer(offer_id: str) -> str:
-    rules = load_rules()
-    key = next(k for k in rules[offer_id] if k.lower().startswith("обязательный"))
-    return rules[offer_id][key]
 
 
 def check_format(response: str, offer_id: str) -> FormatResult:
@@ -59,7 +53,7 @@ def check_format(response: str, offer_id: str) -> FormatResult:
         return FormatResult(False, "секции PUSH:/CARD: обнаружены не ровно по разу — " + FORMAT_REVIEW)
     if (push + card).count("!") > 1:
         return FormatResult(False, "более одного восклицательного знака — " + FORMAT_REVIEW)
-    if _disclaimer(offer_id) in response:
+    if disclaimer_of(offer_id) in response:
         return FormatResult(False, "дисклеймер уже присутствует в тексте creator (дубль) — " + FORMAT_REVIEW)
     if "<user_input>" in response or "</user_input>" in response:
         return FormatResult(False, "в ответе присутствует тег <user_input> — " + FORMAT_REVIEW)

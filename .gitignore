@@ -1,4 +1,3 @@
 .venv
 __pycache__/
 .env
-data/results.json

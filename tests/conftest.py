@@ -104,7 +104,7 @@ def stub_llm_boundary(monkeypatch):
 
     calls = {"creator": 0, "validator": 0}
 
-    def fake_call_creator(card, system, user):
+    def fake_call_creator(card, system, user, variant="default"):
         calls["creator"] += 1
         return _creator_stub(card)
 
