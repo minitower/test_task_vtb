@@ -15,10 +15,10 @@ import csv
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Iterator
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RULES_CSV = DATA_DIR / "rules.csv"
 LOYALTY_CSV = DATA_DIR / "loyalty_level.csv"
 CARDS_JSON = DATA_DIR / "cards.json"

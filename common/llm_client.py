@@ -1,7 +1,7 @@
-"""LLM-клиент. Пока заглушки — подключение Open Router в одной точке.
-
-Замена заглушек: заполнить `chat_completion()` (OpenAI-совместимый API
-Open Router) и, если нужен реальный creator, `_creator_stub()`.
+"""LLM-клиент. Реальный вызов Open Router (OpenAI-совместимый API) — в
+`chat_completion()`; заглушки (`_creator_stub`, `_validator_stub`)
+оставлены для тестов/офлайн-прогонов, но узлы по умолчанию используют
+реальный вызов.
 """
 
 from __future__ import annotations
@@ -9,36 +9,113 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-2-2b-it:free")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
+REQUEST_TIMEOUT_S = 30
 
-_client: Any = None
+# Гиперпараметры LLM по variant creator'а (spec/05 §5). "default" — ближе
+# к детерминированному, точному тексту (низкие temperature/top_p);
+# "creative" (spec/05 §4) — более разнообразная формулировка, поэтому
+# выше. reasoning_effort=None → reasoning отключён совсем (`enabled:
+# false`): проверено на API — даже "low" effort у этой модели тратит
+# сотни токенов на путаный chain-of-thought (вплоть до сомнений в том,
+# какая инструкция настоящая), что и медленнее, и дороже, и на практике
+# не «ниже», а не то, что просит spec/00 (приоритет — быстрый ответ).
+_VARIANT_MODEL_PARAMS: dict[str, dict[str, float | str | None]] = {
+    "default": {"temperature": 0.2, "top_p": 0.2, "reasoning_effort": None},
+    "creative": {"temperature": 0.7, "top_p": 0.9, "reasoning_effort": None},
+}
+
+_session: requests.Session | None = None
 
 
-def chat_completion(system: str, user: str, model: str | None = None, temperature: float = 0.0) -> str:
-    """Реальный вызов LLM (Open Router). Сейчас не реализован — бросает
-    RuntimeError, чтобы случайно не уйти в сеть. Заглушки узлов используют
-    собственные детерминированные ответы (spec/00: простейшие LLM с быстрым
-    ответом; модель и параметры — открытые пункты)."""
-    raise RuntimeError(
-        "LLM не подключён. Задайте "
-        f"{OPENROUTER_API_KEY_ENV} и реализуйте chat_completion() "
-        "для Open Router (base_url=" + OPENROUTER_BASE_URL + ")."
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = requests.Session()
+    return _session
+
+
+def chat_completion(
+    system: str,
+    user: str,
+    model: str | None = None,
+    temperature: float = 0.0,
+    top_p: float | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    """Вызов LLM через Open Router (spec/00: простейшая модель, быстрый
+    ответ). `reasoning_effort` — уровень thinking модели ("low"/"high"/…,
+    зависит от модели); без него reasoning отключается совсем
+    (`enabled: false`) — так поступает validator (детерминированность
+    важнее стиля). Любой сбой (нет ключа, сеть, неожиданный формат
+    ответа, пустой ответ) → RuntimeError — по политике сбоев (spec/00
+    «Любая ошибка LLM → отбрасываем») это ловится на уровне узла графа
+    и уходит в retry/reject, а не чинится здесь."""
+    api_key = os.environ.get(OPENROUTER_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(f"{OPENROUTER_API_KEY_ENV} не задан (.env).")
+
+    payload = {
+        "model": model or OPENROUTER_MODEL,
+        "temperature": temperature,
+        "reasoning": {"effort": reasoning_effort} if reasoning_effort else {"enabled": False},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if top_p is not None:
+        payload["top_p"] = top_p
+
+    try:
+        resp = _get_session().post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Open Router: ошибка запроса: {exc}") from exc
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Open Router: неожиданный формат ответа: {exc}") from exc
+
+    content = (content or "").strip()
+    if not content:
+        raise RuntimeError("Open Router: пустой ответ модели")
+    return content
+
+
+# --------------------------------------------------------------------------- #
+# Creator: реальный вызов Open Router                                        #
+# --------------------------------------------------------------------------- #
+
+def call_creator(card: dict, system: str, user: str, variant: str = "default") -> str:
+    """Creator (LLM) — реальный вызов Open Router. Гиперпараметры берутся
+    по `variant` из `_VARIANT_MODEL_PARAMS` (spec/05 §5). `_creator_stub(card)`
+    остаётся доступной для офлайн-тестов (spec-test-runner)."""
+    params = _VARIANT_MODEL_PARAMS.get(variant, _VARIANT_MODEL_PARAMS["default"])
+    return chat_completion(
+        system, user,
+        temperature=params["temperature"],
+        top_p=params["top_p"],
+        reasoning_effort=params["reasoning_effort"],
     )
-
-
-# --------------------------------------------------------------------------- #
-# Creator: реальный вызов или детерминированная заглушка                      #
-# --------------------------------------------------------------------------- #
-
-def call_creator(card: dict, system: str, user: str) -> str:
-    """Creator (LLM). Открытый пункт: модель/эндпоинт ещё не выбраны,
-    поэтому сейчас — детерминированная заглушка. Замена на Open Router:
-    `return chat_completion(system, user)` — и всё (промпты те же)."""
-    return _creator_stub(card)
 
 
 def _benefit_phrase(b: int, conf: str) -> str:

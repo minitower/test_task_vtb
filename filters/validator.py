@@ -6,7 +6,7 @@ spec/03. LLM — заглушка: её ответ заменяется позж
 решить детерминированно (тон, стиль, «повышался ли уровень», следы инъекций
 в тексте, покрытие V3).
 
-Порог: PASS = (B1 ∧ F1 ∧ F2 ∧ R1 ∧ D1 ∧ P1 ∧ I1 ∧ L3) ∧ (≥ 2 из {L1, L2, V3}).
+Порог: PASS = (B1 ∧ F1 ∧ F2 ∧ R1 ∧ D1 ∧ P1 ∧ I1 ∧ L3 ∧ T1 ∧ T2) ∧ (≥ 2 из {L1, L2, V3}).
 D1 считается в постобработке (spec/04) — здесь, на тексте creator без
 дисклеймера, он не проверяется; на retry-пути его нет по определению
 (format_control).
@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from filters.prefilter import load_rules, load_tier_rank, normalize_numbers
+from filters.prefilter import canonical_name, load_rules, load_tier_rank, normalize_numbers
 
 
 @dataclass
@@ -43,7 +43,7 @@ class ValidatorResult:
     @property
     def pass_(self) -> bool:
         d = self.items_d
-        mandatory = [c for c in ("B1", "F1", "F2", "R1", "P1", "I1", "L3") if c in d]
+        mandatory = [c for c in ("B1", "F1", "F2", "R1", "P1", "I1", "L3", "T1", "T2") if c in d]
         if not all(d[c].pass_ for c in mandatory):
             return False
         important = [c for c in ("L1", "L2", "V3") if c in d]
@@ -85,16 +85,6 @@ def _check_b1(card: dict, push: str, card_text: str) -> ItemResult:
     return ItemResult("B1", True, True)
 
 
-def _extract_numbers(text: str) -> list[int]:
-    nums = re.findall(r"[\d\s]+(?=₽|руб|мес|месяц)\b", text + " ")
-    result = []
-    for n in nums:
-        cleaned = re.sub(r"\D", "", n)
-        if cleaned:
-            result.append(int(cleaned))
-    return result
-
-
 def _extract_all_numbers(text: str) -> list[int]:
     return [int(m) for m in re.findall(r"\d+", normalize_numbers(text))]
 
@@ -122,18 +112,74 @@ def _check_f1(card: dict, push: str, card_text: str) -> ItemResult:
     return ItemResult("F1", True, True)
 
 
+_COND_MARKER_RE = re.compile(r"услови\w*", re.I)
+# Слово-отрицание может стоять не сразу после «условия» («условий в данных
+# нет», «дополнительные условия не указаны», «условий по нему не заявлено») —
+# поэтому ищем его в любом месте всего предложения-клаузы, а не только сразу
+# после маркера (баг: раньше матчился только вариант «условия нет» вплотную).
+_COND_NEGATION_RE = re.compile(
+    r"нет\b|не\s+предусмотр\w*|отсутству\w*|никаких|не\s+требу\w*"
+    r"|не\s+указан\w*|не\s+заявлен\w*|не\s+установлен\w*|не\s+описан\w*",
+    re.I,
+)
+
+
+def _key_tokens(s: str) -> set[str]:
+    return {t for t in re.findall(r"[а-яёa-z]+", s.lower()) if len(t) > 3}
+
+
 def _check_f2(card: dict, push: str, card_text: str) -> ItemResult:
-    """Каждое условие должно быть отражено; не выдумывать условия."""
-    text_norm = re.sub(r"\s+", " ", (push + " " + card_text).lower())
-    for cond in card["decision"]["conditions"]:
+    """Каждое условие должно быть отражено; не выдумывать условия (spec/03 F2).
+
+    Две части проверки:
+    1) каждое условие из `conditions` должно быть отражено в тексте
+       (ключевые слова присутствуют) — иначе FAIL («условие не отражено»);
+    2) в тексте не должно быть условий, которых нет в карточке, включая
+       случай `conditions == []` — иначе цикл по пустому списку никогда
+       не находит нарушений и функция ошибочно проходит (баг: FAIL не
+       детектировался при пустых `conditions`). Ищем в тексте маркеры
+       вида «услови…»; отрицание («условий нет», «условия не указаны»,
+       «условий по нему не заявлено») ищем по всей клаузе до конца
+       предложения, а не только вплотную к маркеру — в естественной речи
+       слово-отрицание почти всегда стоит дальше в предложении. Если
+       отрицания нет — сверяем упомянутую формулировку с реальными
+       условиями карточки: несовпадение = придуманное условие → FAIL.
+    """
+    text = push + " " + card_text
+    text_norm = re.sub(r"\s+", " ", text.lower())
+    conditions = card["decision"]["conditions"]
+
+    for cond in conditions:
         cond_norm = re.sub(r"\s+", " ", cond.lower())
         # Ключевые слова условия должны присутствовать
-        key_tokens = [t for t in re.findall(r"[а-яёa-z]+" , cond_norm) if len(t) > 3]
+        key_tokens = [t for t in re.findall(r"[а-яёa-z]+", cond_norm) if len(t) > 3]
         if not key_tokens:
             continue
         found = sum(1 for t in key_tokens if t in text_norm)
         if found < max(1, len(key_tokens) // 2):
             return ItemResult("F2", True, False, f"условие не отражено: {cond!r}")
+
+    all_cond_tokens: set[str] = set()
+    for cond in conditions:
+        all_cond_tokens |= _key_tokens(cond)
+
+    for m in _COND_MARKER_RE.finditer(text):
+        rest = text[m.end():]
+        end = re.search(r"[.!?]|$", rest)
+        clause = rest[: end.start()] if end else rest
+        if _COND_NEGATION_RE.search(clause):
+            continue
+        clause = clause.strip(" :;-—")
+        clause_tokens = _key_tokens(clause)
+        if not clause_tokens:
+            continue
+        overlap = clause_tokens & all_cond_tokens
+        if len(overlap) < max(1, len(clause_tokens) // 2):
+            return ItemResult(
+                "F2", True, False,
+                f"выдуманное условие, которого нет в карточке: {clause!r}",
+            )
+
     return ItemResult("F2", True, True)
 
 
@@ -207,24 +253,75 @@ def _check_p1(card: dict, push: str, card_text: str) -> ItemResult:
     return ItemResult("P1", True, True)
 
 
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _canonical_latin_whitelist(card: dict) -> set[str]:
+    """Латинские слова из самого канонического названия оффера («Silver»,
+    «Gold») — часть обязательного факта (spec/05), а не посторонний язык,
+    поэтому единственное разрешённое исключение из проверки T1."""
+    name = canonical_name(card["decision"]["offer_id"])
+    return {w.lower() for w in _LATIN_WORD_RE.findall(name)}
+
+
+def _check_lang(card: dict, push: str, card_text: str) -> ItemResult:
+    """T1 (spec/03): текст PUSH/CARD — только на русском.
+
+    Допустимы: кириллица, цифры, стандартная пунктуация/валюта и латинские
+    слова, входящие в каноническое название оффера (Silver/Gold — часть
+    бренда, не смешение языка). Любая другая буква не из кириллицы
+    (латиница, посторонний алфавит, иероглифы и т.п.) — FAIL: утечка
+    чужого языка/мусора в клиентский текст недопустима даже при
+    некорректном ответе модели (CLAUDE.md, приоритет — безопасность).
+    """
+    whitelist = _canonical_latin_whitelist(card)
+    for label, text in (("PUSH", push), ("CARD", card_text)):
+        scrubbed = text
+        for word in whitelist:
+            scrubbed = re.sub(re.escape(word), "", scrubbed, flags=re.I)
+        for ch in scrubbed:
+            if ch.isalpha() and ch.lower() not in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя":
+                return ItemResult(
+                    "T1", True, False,
+                    f"{label}: нерусский символ {ch!r} — текст должен быть только на русском",
+                )
+    return ItemResult("T1", True, True)
+
+
+# Символ, повторённый подряд 3+ раза — признак сбоя генерации («ааа»,
+# «!!!»). Цифры и пробелы исключены: легитимные числа вида «300 000» или
+# «40 000» не должны ложно попадать под срабатывание.
+_DUP_CHAR_RE = re.compile(r"([^\d\s])\1{2,}")
+
+
+def _check_dup_chars(card: dict, push: str, card_text: str) -> ItemResult:
+    """T2 (spec/03): нет аномальных повторов одного символа подряд в тексте
+    PUSH/CARD — признак сбоя генерации модели (зацикливание/«заикание»),
+    а не осмысленного текста. Числа исключены из проверки (см. `_DUP_CHAR_RE`).
+    """
+    for label, text in (("PUSH", push), ("CARD", card_text)):
+        m = _DUP_CHAR_RE.search(text)
+        if m:
+            return ItemResult(
+                "T2", True, False,
+                f"{label}: символ {m.group(1)!r} повторён подряд {len(m.group(0))} раз — похоже на сбой генерации",
+            )
+    return ItemResult("T2", True, True)
+
+
 # --------------------------------------------------------------------------- #
 # LLM-validator                                                               #
 # --------------------------------------------------------------------------- #
 
 def llm_validate(card: dict, push: str, card_text: str, system_prompt: str, user_prompt: str) -> str:
-    """Вызывает LLM-validator.
+    """Вызывает LLM-validator через Open Router (llm_client.chat_completion).
 
-    Сейчас — детерминированная заглушка (llm_client._validator_stub): до
-    подключения Open Router возвращает проверяемый JSON по карточке.
-    После подключения:
-    ```
-    from llm_client import chat_completion
-    return chat_completion(system_prompt, user_prompt)
-    ```
+    `llm_client._validator_stub` остаётся доступной отдельно для офлайн-тестов
+    (spec-test-runner), но здесь по умолчанию используется реальный вызов.
     """
-    from common.llm_client import _validator_stub
+    from common.llm_client import chat_completion
 
-    return _validator_stub(card, push, card_text)
+    return chat_completion(system_prompt, user_prompt)
 
 
 def _parse_llm_verdict(raw: str) -> dict | None:
@@ -264,21 +361,30 @@ def run_validator(card: dict, push: str, card_text: str) -> ValidatorResult:
     result = ValidatorResult()
 
     # Python-проверки
-    for check in (_check_b1, _check_f1, _check_f2, _check_r1, _check_p1):
+    for check in (_check_b1, _check_f1, _check_f2, _check_r1, _check_p1,
+                  _check_lang, _check_dup_chars):
         item = check(card, push, card_text)
         result.items.append(item)
 
     # LLM-проверки
     system_prompt, user_prompt = build_validator_prompts(card, push, card_text)
-    raw = llm_validate(card, push, card_text, system_prompt, user_prompt)
+    try:
+        raw = llm_validate(card, push, card_text, system_prompt, user_prompt)
+    except Exception as exc:
+        # Сбой LLM (spec/00): не чиним, доводим до тех же блокирующих FAIL,
+        # что и нераспознанный JSON — дальше решает retry/reject.
+        raw = ""
+        llm_error = str(exc)
+    else:
+        llm_error = None
     result.llm_raw = raw
-    verdict = _parse_llm_verdict(raw)
+    verdict = _parse_llm_verdict(raw) if raw else None
 
     if verdict is None:
-        # Нераспознанный JSON → все LLM-пункты FAIL (блокирующая L3, I1)
+        reason = f"ошибка LLM: {llm_error}" if llm_error else "LLM-ответ не распознан"
         for code, blocking in [("L1", False), ("L2", False), ("L3", True),
                                ("I1", True), ("V3", False), ("V4", False), ("V5", False)]:
-            result.items.append(ItemResult(code, blocking, False, "LLM-ответ не распознан"))
+            result.items.append(ItemResult(code, blocking, False, reason))
     else:
         for code, blocking in [("L1", False), ("L2", False), ("L3", True),
                                ("I1", True), ("V3", False), ("V4", False), ("V5", False)]:

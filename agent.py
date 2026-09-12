@@ -9,13 +9,19 @@ postprocess → retry с review (max 3 попытки) → END(REJECT_VALIDATION
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import sys
+import time
+from pathlib import Path
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from filters.format_control import check_format
+import common.llm_client as llm_client_mod
 from common.llm_client import call_creator
+from common.logging_utils import make_event
 from filters.postprocessing import run_postprocessing
 from filters.prefilter import run_prefilter
 from common.prompt_assembly import build_creator_prompts, get_card_by_ref, load_cards
@@ -23,10 +29,20 @@ from filters.validator import run_validator
 
 MAX_ATTEMPTS = 3
 
+# Коды Python-проверок validator'а (spec/03 §1) — используются, чтобы
+# разложить один ValidatorResult на два stage-события лога (spec/07):
+# `python_checks` (детерминированные) и `validator_llm` (LLM-коды).
+_PYTHON_CHECK_CODES = ("B1", "F1", "F2", "R1", "P1", "T1", "T2")
+
+
+def _dur_ms(t0: float) -> float:
+    return round((time.perf_counter() - t0) * 1000, 3)
+
 
 class PipelineState(TypedDict, total=False):
     client_ref: str
     card: dict
+    variant: str
     attempt: int
     prior_attempt: str
     review: list
@@ -40,17 +56,31 @@ class PipelineState(TypedDict, total=False):
     final_card: str
     status: str
     log: list
+    llm_calls: int
+    total_dur_ms: float
 
 
 def _n_prefilter(state: PipelineState) -> dict:
     card = state["card"]
+    client_ref = state["client_ref"]
+    t0 = time.perf_counter()
     res = run_prefilter(card)
+    dur = _dur_ms(t0)
     log = list(state.get("log", [])) + [
-        f"[prefilter] {state['client_ref']}: {res.decision}"
-        + (f" ({res.reason}) {res.detail}" if res.reason else "")
+        make_event(
+            "input", client_ref, 1,
+            ok=res.ok, reason=res.reason, detail=res.detail, dur_ms=dur,
+        )
     ]
     if not res.ok:
         # Это штатное решение, не ошибка входа (spec/01 §4): в логе отдельно.
+        log = log + [
+            make_event(
+                "final", client_ref, 1,
+                result="REJECT_INPUT", reason=res.reason,
+                total_attempts=0, total_llm_calls=0, total_dur_ms=dur,
+            )
+        ]
         return {"status": "REJECT_INPUT", "log": log}
     return {
         "attempt": 1,
@@ -62,18 +92,62 @@ def _n_prefilter(state: PipelineState) -> dict:
         "failed_items": [],
         "status": "",
         "log": log,
+        "llm_calls": 0,
+        "total_dur_ms": dur,
     }
 
 
 def _n_creator(state: PipelineState) -> dict:
     card = state["card"]
+    client_ref = state["client_ref"]
     attempt = state.get("attempt", 1)
+    total_dur = state.get("total_dur_ms", 0.0)
+    llm_calls = state.get("llm_calls", 0) + 1
+    variant = state.get("variant", "default")
     system, user = build_creator_prompts(
-        card, attempt, state.get("prior_attempt"), state.get("review")
+        card, attempt, state.get("prior_attempt"), state.get("review"),
+        variant=variant,
     )
-    response = call_creator(card, system, user)
-    log = list(state.get("log", [])) + [f"[creator] попытка {attempt}: ответ получен"]
-    return {"creator_response": response, "log": log}
+    t0 = time.perf_counter()
+    try:
+        response = call_creator(card, system, user, variant=variant)
+    except Exception as exc:
+        # Сбой LLM (spec/00): не чиним — идём в retry_gate тем же путём,
+        # что и провал формат-контроля/валидатора.
+        dur = _dur_ms(t0)
+        log = list(state.get("log", [])) + [
+            make_event(
+                "creator_llm", client_ref, attempt,
+                ok=False, dur_ms=dur, ttft_ms=dur, model=llm_client_mod.OPENROUTER_MODEL,
+                error=str(exc)[:200],
+            )
+        ]
+        return {
+            "creator_response": "",
+            "failed_items": [{"code": "LLM_ERROR", "blocking": True, "reason": str(exc)}],
+            "log": log,
+            "llm_calls": llm_calls,
+            "total_dur_ms": total_dur + dur,
+        }
+    dur = _dur_ms(t0)
+    log = list(state.get("log", [])) + [
+        make_event(
+            "creator_llm", client_ref, attempt,
+            ok=True, dur_ms=dur, ttft_ms=dur, response_len=len(response),
+            model=llm_client_mod.OPENROUTER_MODEL,
+        )
+    ]
+    return {
+        "creator_response": response,
+        "failed_items": [],
+        "log": log,
+        "llm_calls": llm_calls,
+        "total_dur_ms": total_dur + dur,
+    }
+
+
+def _creator_ok(state: PipelineState) -> str:
+    return "format_check" if state.get("creator_response") else "retry_gate"
 
 
 def _format_ok(state: PipelineState) -> str:
@@ -81,16 +155,25 @@ def _format_ok(state: PipelineState) -> str:
 
 
 def _n_format_check(state: PipelineState) -> dict:
+    client_ref = state["client_ref"]
+    attempt = state.get("attempt", 1)
+    t0 = time.perf_counter()
     res = check_format(state["creator_response"], state["card"]["decision"]["offer_id"])
+    dur = _dur_ms(t0)
+    total_dur = state.get("total_dur_ms", 0.0) + dur
     log = list(state.get("log", [])) + [
-        f"[format] попытка {state.get('attempt')}: {'OK' if res.ok else 'FAIL: ' + res.violation}"
+        make_event(
+            "format_check", client_ref, attempt,
+            ok=res.ok, violation=(res.violation if not res.ok else ""), dur_ms=dur,
+        )
     ]
     if not res.ok:
         return {
             "failed_items": [{"code": "FORMAT", "blocking": True, "reason": res.violation}],
             "log": log,
+            "total_dur_ms": total_dur,
         }
-    return {"push": res.push, "card_text": res.card, "log": log}
+    return {"push": res.push, "card_text": res.card, "log": log, "total_dur_ms": total_dur}
 
 
 def _validator_ok(state: PipelineState) -> str:
@@ -99,14 +182,45 @@ def _validator_ok(state: PipelineState) -> str:
 
 
 def _n_validator_node(state: PipelineState) -> dict:
+    client_ref = state["client_ref"]
+    attempt = state.get("attempt", 1)
+    t0 = time.perf_counter()
     result = run_validator(state["card"], state["push"], state["card_text"])
+    dur = _dur_ms(t0)
+    total_dur = state.get("total_dur_ms", 0.0) + dur
+    llm_calls = state.get("llm_calls", 0) + 1
+
+    items_d = result.items_d
+    python_failed = [c for c in _PYTHON_CHECK_CODES if c in items_d and not items_d[c].pass_]
+    parsed = False
+    if result.llm_raw:
+        try:
+            json.loads(result.llm_raw)
+            parsed = True
+        except (json.JSONDecodeError, TypeError):
+            parsed = False
+
+    # Python-часть (детерминированные коды, spec/03 §1) — своё событие;
+    # dur_ms этой части отдельно не инструментирован внутри run_validator
+    # (единый вызов на Python+LLM), поэтому вся длительность отнесена к
+    # `validator_llm`, где сосредоточена сетевая задержка.
     log = list(state.get("log", [])) + [
-        f"[validator] попытка {state.get('attempt')}: {'PASS' if result.pass_ else 'FAIL: ' + '; '.join(f['code'] for f in result.failures())}"
+        make_event(
+            "python_checks", client_ref, attempt,
+            ok=not python_failed, codes=python_failed, dur_ms=0,
+        ),
+        make_event(
+            "validator_llm", client_ref, attempt,
+            ok=bool(result.llm_raw), parsed=parsed, dur_ms=dur, ttft_ms=dur,
+            verdict=("PASS" if result.pass_ else "FAIL"),
+        ),
     ]
     return {
         "validation": {"pass": result.pass_, "items": result.items, "failures": result.failures()},
         "failed_items": result.failures(),
         "log": log,
+        "llm_calls": llm_calls,
+        "total_dur_ms": total_dur,
     }
 
 
@@ -116,19 +230,38 @@ def _post_ok(state: PipelineState) -> str:
 
 
 def _n_postprocess(state: PipelineState) -> dict:
+    client_ref = state["client_ref"]
+    attempt = state.get("attempt", 1)
+    t0 = time.perf_counter()
     res = run_postprocessing(state["push"], state["card_text"], state["card"]["decision"]["offer_id"])
+    dur = _dur_ms(t0)
+    total_dur = state.get("total_dur_ms", 0.0) + dur
     log = list(state.get("log", [])) + [
-        f"[post] {'OK' if res.ok else 'FAIL: ' + res.failure}"
+        make_event(
+            "postprocess", client_ref, attempt,
+            ok=res.ok, failure=(res.failure if not res.ok else ""), dur_ms=dur,
+        )
     ]
-    return {"post": {"ok": res.ok, "push": res.push, "card": res.card, "failure": res.failure}, "log": log}
+    return {
+        "post": {"ok": res.ok, "push": res.push, "card": res.card, "failure": res.failure},
+        "log": log,
+        "total_dur_ms": total_dur,
+    }
 
 
 def _n_accept(state: PipelineState) -> dict:
     p = state["post"]
+    client_ref = state["client_ref"]
+    attempt = state.get("attempt", 1)
     log = list(state.get("log", [])) + [
-        f"[accept] {state['client_ref']}: PASS после {state.get('attempt')} попыток",
-        "PUSH: " + p["push"],
-        "CARD: " + p["card"],
+        make_event(
+            "final", client_ref, attempt,
+            result="SEND", reason="", total_attempts=attempt,
+            total_llm_calls=state.get("llm_calls", 0),
+            total_dur_ms=state.get("total_dur_ms", 0.0),
+            # Только длины — не полный текст (spec/07 §1, §5).
+            push_len=len(p["push"]), card_len=len(p["card"]),
+        )
     ]
     return {"final_push": p["push"], "final_card": p["card"], "status": "ACCEPT", "log": log}
 
@@ -138,10 +271,15 @@ def _retry_to_creator(state: PipelineState) -> str:
 
 
 def _n_retry_gate(state: PipelineState) -> dict:
+    client_ref = state["client_ref"]
     attempt = state.get("attempt", 1)
     failed = state.get("failed_items", [])
-    review_text = "\n".join(f"{i}. {f['code']}: {f['reason']}" for i, f in enumerate(failed, 1))
-    log = list(state.get("log", [])) + [f"[retry] попытка {attempt}, review: {review_text or '-'}"]
+    codes = [f["code"] for f in failed]
+    reason = codes[0] if codes else "unknown"
+    next_attempt = attempt + 1 if attempt < MAX_ATTEMPTS else attempt
+    log = list(state.get("log", [])) + [
+        make_event("retry", client_ref, next_attempt, reason=reason, codes=codes, dur_ms=0)
+    ]
     if attempt >= MAX_ATTEMPTS:
         return {"status": "REJECT_VALIDATION", "log": log}
     return {
@@ -153,7 +291,18 @@ def _n_retry_gate(state: PipelineState) -> dict:
 
 
 def _n_reject_validation(state: PipelineState) -> dict:
-    log = list(state.get("log", [])) + [f"[reject] {state['client_ref']}: исчерпаны {MAX_ATTEMPTS} попытки"]
+    client_ref = state["client_ref"]
+    attempt = state.get("attempt", 1)
+    failed = state.get("failed_items", [])
+    reason = failed[0]["code"] if failed else "unknown"
+    log = list(state.get("log", [])) + [
+        make_event(
+            "final", client_ref, attempt,
+            result="REJECT_VALIDATION", reason=f"{reason} after {MAX_ATTEMPTS} attempts",
+            total_attempts=attempt, total_llm_calls=state.get("llm_calls", 0),
+            total_dur_ms=state.get("total_dur_ms", 0.0),
+        )
+    ]
     return {"status": "REJECT_VALIDATION", "log": log}
 
 
@@ -174,7 +323,7 @@ def build_graph() -> StateGraph:
 
     g.add_edge(START, "prefilter")
     g.add_conditional_edges("prefilter", _prefilter_route, {"creator": "creator", END: END})
-    g.add_edge("creator", "format_check")
+    g.add_conditional_edges("creator", _creator_ok, {"format_check": "format_check", "retry_gate": "retry_gate"})
     g.add_conditional_edges("format_check", _format_ok, {"validator": "validator_node", "retry_gate": "retry_gate"})
     g.add_conditional_edges("validator_node", _validator_ok, {"postprocess": "postprocess", "retry_gate": "retry_gate"})
     g.add_conditional_edges("postprocess", _post_ok, {"accept": "accept", "retry_gate": "retry_gate"})
@@ -187,22 +336,118 @@ def build_graph() -> StateGraph:
 PIPELINE = build_graph().compile()
 
 
-def run_card(card: dict | None = None, client_ref: str | None = None, cards: list[dict] | None = None) -> dict:
-    """Прогнать одну карточку (или по client_ref из cards.json) через pipeline."""
+def run_card(
+    card: dict | None = None,
+    client_ref: str | None = None,
+    cards: list[dict] | None = None,
+    variant: str = "default",
+) -> dict:
+    """Прогнать одну карточку (или по client_ref из cards.json) через pipeline.
+
+    `variant` выбирает набор промптов creator'а (common/prompt_assembly.py,
+    "default" или "creative") — validator и порог прохода не меняются.
+    """
     if card is None:
         cards = cards or load_cards()
         card = get_card_by_ref(cards, client_ref)
-    state = {"client_ref": card["client_ref"], "card": card, "log": []}
+    state = {"client_ref": card["client_ref"], "card": card, "variant": variant, "log": []}
     return PIPELINE.invoke(state)
 
 
-def run_all() -> dict[str, dict]:
-    return {c["client_ref"]: run_card(c) for c in load_cards()}
+def run_all(variant: str = "default") -> dict[str, dict]:
+    return {c["client_ref"]: run_card(c, variant=variant) for c in load_cards()}
+
+
+def _json_default(obj: Any) -> Any:
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _summarize(client_ref: str, state: dict) -> dict:
+    """Сводка по карточке для log.json — без сырых данных карточки и
+    без полного текста push/card (spec/07 §1/§5: только поля решения и
+    длины, лог не должен течь персональными/офферными данными). Сам
+    финальный текст — не лог, а результат pipeline: он уходит в
+    data/results.md (см. `_to_markdown`), не сюда.
+    """
+    summary: dict[str, Any] = {
+        "client_ref": client_ref,
+        "status": state.get("status"),
+        "total_attempts": state.get("attempt"),
+        "total_llm_calls": state.get("llm_calls"),
+        "total_dur_ms": state.get("total_dur_ms"),
+        "log": state.get("log", []),
+    }
+    if state.get("status") == "ACCEPT":
+        summary["push_len"] = len(state.get("final_push", ""))
+        summary["card_len"] = len(state.get("final_card", ""))
+    return summary
+
+
+def _to_markdown(results: dict[str, dict]) -> str:
+    """Итоговый текст по карточкам (не лог): client_ref, PUSH, CARD —
+    то, что реально уходит клиенту. Для отброшенных карточек текста нет —
+    указывается статус отброса вместо PUSH/CARD."""
+    blocks = []
+    for client_ref, state in results.items():
+        status = state.get("status")
+        if status == "ACCEPT":
+            body = f"PUSH: {state.get('final_push', '')}\nCARD: {state.get('final_card', '')}"
+        else:
+            body = f"_{status}_"
+        blocks.append(f"## {client_ref}\n\n{body}")
+    return "\n\n".join(blocks) + "\n"
+
+
+LOG_JSON = Path(__file__).resolve().parent / "data" / "log.json"
+RESULTS_MD = Path(__file__).resolve().parent / "data" / "results.md"
 
 
 if __name__ == "__main__":
-    results = run_all()
+    # На Windows консоль по умолчанию не в UTF-8 — без этого print падает
+    # на кириллице/₽ (UnicodeEncodeError).
+    sys.stdout.reconfigure(encoding="utf-8")
+
+    # --variant creative (в любом месте argv) → creator берёт другой набор
+    # промптов (common/prompt_assembly.py); validator и порог те же.
+    argv = sys.argv[1:]
+    variant = "default"
+    if "--variant" in argv:
+        i = argv.index("--variant")
+        variant = argv[i + 1]
+        del argv[i:i + 2]
+
+    # Один client_ref позиционным аргументом → быстрый прогон одной
+    # карточки для отладки (не трогает data/log*.json и data/results*.md,
+    # печатает и текст ответа).
+    if argv:
+        client_ref = argv[0]
+        st = run_card(client_ref=client_ref, variant=variant)
+        print(f"{client_ref} -> {st.get('status')}")
+        for line in st.get("log", []):
+            print("   " + line)
+        if st.get("status") == "ACCEPT":
+            print("\nPUSH:", st.get("final_push"))
+            print("CARD:", st.get("final_card"))
+        sys.exit(0)
+
+    results = run_all(variant=variant)
     for ref, st in results.items():
         print(f"{ref} -> {st.get('status')}")
         for line in st.get("log", []):
             print("   " + line)
+
+    suffix = "" if variant == "default" else f"_{variant}"
+    log_json = LOG_JSON.with_stem(LOG_JSON.stem + suffix)
+    results_md = RESULTS_MD.with_stem(RESULTS_MD.stem + suffix)
+
+    summaries = {ref: _summarize(ref, st) for ref, st in results.items()}
+    with open(log_json, "w", encoding="utf-8") as f:
+        json.dump(summaries, f, ensure_ascii=False, indent=2, default=_json_default)
+
+    with open(results_md, "w", encoding="utf-8") as f:
+        f.write(_to_markdown(results))
+
+    print(f"\nСохранено: {log_json}")
+    print(f"Сохранено: {results_md}")

@@ -38,4 +38,6 @@ START
   только в лог, не блокируют.
 
 ## Открытые пункты
-- Параметры LLM (модель/эндпоинт, temperature, max_tokens) — настроить позже.
+- Модель/эндпоинт и temperature/top_p/reasoning_effort по variant creator'а
+  решены — см. spec/05 §5. max_tokens не задан явно (формат-контракт
+  spec/02 и так ограничивает длину ответа).
