@@ -21,13 +21,26 @@
 | stage | Что логируется |
 |-------|----------------|
 | `input` | проход входных фильтров (spec/01): какие фильтры прошли/упали, `reason` при DROP, длительность фильтров `dur_ms`. |
-| `creator_llm` | **TTFT** (time-to-first-token, от запроса до первого символа), `dur_ms` (полный ответ), `prompt_tokens`, `completion_tokens`, `model`, `max_attempts_sofar` ( номер попытки), `ok`. |
+| `creator_llm` | **TTFT** (time-to-first-token, от запроса до первого символа), `dur_ms` (полный ответ), `prompt_tokens`, `completion_tokens`, `model`, `max_attempts_sofar` ( номер попытки), `ok`; при `ok=false` — `error`, `error_code` (см. §2.1). |
 | `format_check` | PASS/FAIL формат-контроля (spec/02): какие проверки упали (например «PUSH len 82>70»), `dur_ms`. |
 | `python_checks` | PASS/FAIL детерминированных проверок (spec/03, кодом): список кодов, которые упали (B1, F1, F2, R1, P1…), `dur_ms`. |
-| `validator_llm` | TTFT, `dur_ms`, `prompt_tokens`, `completion_tokens`, `ok`, `parsed` (JSON распарсился?), `verdict` (PASS/FAIL по схеме). |
+| `validator_llm` | TTFT, `dur_ms`, `prompt_tokens`, `completion_tokens`, `ok`, `parsed` (JSON распарсился?), `verdict` (PASS/FAIL по схеме); при сбое LLM-вызова — `error_code` (см. §2.1). |
 | `postprocess` | проход постобработки (spec/04): вставка дисклеймера (ok/dup), финальный контроль (тэг, служебные поля, длина), `dur_ms`. |
 | `retry` | переход на новую попытку: `attempt`, причина (какой stage сработал), список `codes` упавших пунктов. |
 | `final` | итог по карточке: `result` (SEND / REJECT_*), `reason`, `total_attempts`, `total_llm_calls`, `total_dur_ms`. |
+
+### 2.1 Коды ошибок LLM-вызова (`error_code` на `creator_llm`/`validator_llm`)
+
+Спецификация — spec/03 §5. Два статуса, один новый:
+
+| `error_code` | Значение |
+|--------------|----------|
+| `LLM_ERROR` | Прочий сбой вызова (пустой ответ, неожиданный формат, нераспарсируемый JSON) — обычный content-retry, как раньше. |
+| `LLM_UNREACHABLE` | Сетевая ошибка или HTTP-код не 2xx (402, 5xx и т.п.) повторились подряд, и внутренние ретраи транспортного уровня (`common/llm_client.py`, `LLM_MAX_RETRIES`) исчерпаны — сервис не дал пригодного ответа ни разу. |
+
+`LLM_UNREACHABLE` — инфраструктурный, не content-сбой: retry creator'а
+(`retry_gate`) для него пропускается, попытки не расходуются (spec/03
+§5) — `final.reason` для таких карточек не содержит «after N attempts».
 
 ## 3. Основные KPI (вычисляются из событий `creator_llm`/`validator_llm`/`final`)
 - **TTFT** (time-to-first-token): отдельно для creator и для validator,

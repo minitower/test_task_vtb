@@ -35,6 +35,10 @@ class ItemResult:
 class ValidatorResult:
     items: list[ItemResult] = field(default_factory=list)
     llm_raw: str = ""
+    # Код инфраструктурного сбоя LLM-вызова validator'а (spec/03 §5):
+    # "LLM_UNREACHABLE" — retry_gate пропускается (agent.py), в отличие
+    # от обычного "нераспознан ответ" (пусто).
+    llm_error_code: str = ""
 
     @property
     def items_d(self) -> dict[str, ItemResult]:
@@ -368,8 +372,18 @@ def run_validator(card: dict, push: str, card_text: str) -> ValidatorResult:
 
     # LLM-проверки
     system_prompt, user_prompt = build_validator_prompts(card, push, card_text)
+    from common.llm_client import LLMUnreachableError
+
     try:
         raw = llm_validate(card, push, card_text, system_prompt, user_prompt)
+    except LLMUnreachableError as exc:
+        # Инфраструктурный сбой (spec/03 §5): llm_client.py уже отретраил
+        # запрос и не получил пригодного ответа — код прокидывается в
+        # agent.py, чтобы retry_gate был пропущен (в отличие от обычного
+        # LLM_ERROR ниже).
+        raw = ""
+        llm_error = str(exc)
+        result.llm_error_code = "LLM_UNREACHABLE"
     except Exception as exc:
         # Сбой LLM (spec/00): не чиним, доводим до тех же блокирующих FAIL,
         # что и нераспознанный JSON — дальше решает retry/reject.

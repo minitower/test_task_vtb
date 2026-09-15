@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 import requests
 from dotenv import load_dotenv
@@ -19,6 +20,18 @@ OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
 REQUEST_TIMEOUT_S = 30
+
+# Внутренний (транспортный) retry одного вызова chat_completion — отдельно
+# от pipeline-level retry creator'а (agent.py, MAX_ATTEMPTS). Ловит
+# короткие сетевые сбои/5xx, которые лечатся повтором того же запроса.
+LLM_MAX_RETRIES = 2
+LLM_RETRY_BACKOFF_S = 0.5
+
+
+class LLMUnreachableError(RuntimeError):
+    """Сервис не дал пригодного ответа после `LLM_MAX_RETRIES + 1` попыток
+    подряд (сетевая ошибка или HTTP-код не 2xx — 402, 5xx и т.п.: конкретный
+    код не важен, важно, что тот же запрос повторил тот же провал)."""
 
 # Гиперпараметры LLM по variant creator'а (spec/05 §5). "default" — ближе
 # к детерминированному, точному тексту (низкие temperature/top_p);
@@ -75,19 +88,35 @@ def chat_completion(
     if top_p is not None:
         payload["top_p"] = top_p
 
-    try:
-        resp = _get_session().post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=REQUEST_TIMEOUT_S,
-        )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Open Router: ошибка запроса: {exc}") from exc
+    resp = None
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        is_last = attempt == LLM_MAX_RETRIES
+        try:
+            resp = _get_session().post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=REQUEST_TIMEOUT_S,
+            )
+        except requests.RequestException as exc:
+            if is_last:
+                raise LLMUnreachableError(
+                    f"Open Router: сервис недоступен после {attempt + 1} попыток: {exc}"
+                ) from exc
+            time.sleep(LLM_RETRY_BACKOFF_S)
+            continue
+
+        if resp.ok:
+            break
+        if is_last:
+            raise LLMUnreachableError(
+                f"Open Router: сервис недоступен после {attempt + 1} попыток "
+                f"(последний код {resp.status_code})"
+            )
+        time.sleep(LLM_RETRY_BACKOFF_S)
 
     try:
         data = resp.json()

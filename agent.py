@@ -5,6 +5,8 @@ START → prefilter → creator (LLM/заглушка) → format_check
 
 Ветки: prefilter fail → END(REJECT_INPUT); fail на format/validator/
 postprocess → retry с review (max 3 попытки) → END(REJECT_VALIDATION).
+Инфраструктурный сбой LLM-вызова (402/сеть недоступна, spec/03 §5) —
+исключение: retry_gate пропускается, отброс сразу, без расхода попыток.
 """
 
 from __future__ import annotations
@@ -33,6 +35,18 @@ MAX_ATTEMPTS = 3
 # разложить один ValidatorResult на два stage-события лога (spec/07):
 # `python_checks` (детерминированные) и `validator_llm` (LLM-коды).
 _PYTHON_CHECK_CODES = ("B1", "F1", "F2", "R1", "P1", "T1", "T2")
+
+# LLM-инфраструктурный сбой (spec/03 §5): llm_client.py уже отретраил
+# запрос на транспортном уровне и не получил ни одного пригодного ответа
+# (сеть недоступна, HTTP-код не 2xx — 402/5xx/…), поэтому дальнейший
+# retry creator'а бессмыслен — попытки не расходуются, отброс сразу.
+_NON_RETRYABLE_LLM_CODES = {"LLM_UNREACHABLE"}
+
+
+def _llm_error_code(exc: Exception) -> str:
+    if isinstance(exc, llm_client_mod.LLMUnreachableError):
+        return "LLM_UNREACHABLE"
+    return "LLM_ERROR"
 
 
 def _dur_ms(t0: float) -> float:
@@ -134,19 +148,23 @@ def _n_creator(state: PipelineState) -> dict:
         response = call_creator(card, system, user, variant=variant)
     except Exception as exc:
         # Сбой LLM (spec/00): не чиним — идём в retry_gate тем же путём,
-        # что и провал формат-контроля/валидатора.
+        # что и провал формат-контроля/валидатора. Исключение —
+        # инфраструктурные сбои (402, сеть недоступна после внутренних
+        # ретраев llm_client.py): они не расходуют попытки creator'а
+        # (spec/03 §5) — см. _creator_ok.
         dur = _dur_ms(t0)
-        _say(state, f"[{attempt}] Сбой LLM за {dur:.0f} мс: {exc}")
+        code = _llm_error_code(exc)
+        _say(state, f"[{attempt}] Сбой LLM за {dur:.0f} мс ({code}): {exc}")
         log = list(state.get("log", [])) + [
             make_event(
                 "creator_llm", client_ref, attempt,
                 ok=False, dur_ms=dur, ttft_ms=dur, model=llm_client_mod.OPENROUTER_MODEL,
-                error=str(exc)[:200],
+                error=str(exc)[:200], error_code=code,
             )
         ]
         return {
             "creator_response": "",
-            "failed_items": [{"code": "LLM_ERROR", "blocking": True, "reason": str(exc)}],
+            "failed_items": [{"code": code, "blocking": True, "reason": str(exc)}],
             "log": log,
             "llm_calls": llm_calls,
             "total_dur_ms": total_dur + dur,
@@ -170,7 +188,12 @@ def _n_creator(state: PipelineState) -> dict:
 
 
 def _creator_ok(state: PipelineState) -> str:
-    return "format_check" if state.get("creator_response") else "retry_gate"
+    if state.get("creator_response"):
+        return "format_check"
+    codes = {f["code"] for f in state.get("failed_items", [])}
+    if codes & _NON_RETRYABLE_LLM_CODES:
+        return "reject_validation"
+    return "retry_gate"
 
 
 def _format_ok(state: PipelineState) -> str:
@@ -203,7 +226,12 @@ def _n_format_check(state: PipelineState) -> dict:
 
 def _validator_ok(state: PipelineState) -> str:
     v = state.get("validation")
-    return "postprocess" if v and v["pass"] else "retry_gate"
+    if v and v["pass"]:
+        return "postprocess"
+    codes = {f["code"] for f in state.get("failed_items", [])}
+    if codes & _NON_RETRYABLE_LLM_CODES:
+        return "reject_validation"
+    return "retry_gate"
 
 
 def _n_validator_node(state: PipelineState) -> dict:
@@ -238,16 +266,22 @@ def _n_validator_node(state: PipelineState) -> dict:
             "validator_llm", client_ref, attempt,
             ok=bool(result.llm_raw), parsed=parsed, dur_ms=dur, ttft_ms=dur,
             verdict=("PASS" if result.pass_ else "FAIL"),
+            error_code=result.llm_error_code,
         ),
     ]
+    failures = result.failures()
+    if result.llm_error_code:
+        # Инфраструктурный сбой (spec/03 §5) — отдельный код поверх
+        # L3/I1-провалов, чтобы _validator_ok пропустил retry_gate.
+        failures = failures + [{"code": result.llm_error_code, "blocking": True, "reason": result.llm_error_code}]
     if result.pass_:
         _say(state, f"[{attempt}] Validator: PASS")
     else:
-        codes = ", ".join(f["code"] for f in result.failures())
+        codes = ", ".join(f["code"] for f in failures)
         _say(state, f"[{attempt}] Validator: FAIL — {codes}")
     return {
-        "validation": {"pass": result.pass_, "items": result.items, "failures": result.failures()},
-        "failed_items": result.failures(),
+        "validation": {"pass": result.pass_, "items": result.items, "failures": failures},
+        "failed_items": failures,
         "log": log,
         "llm_calls": llm_calls,
         "total_dur_ms": total_dur,
@@ -336,11 +370,20 @@ def _n_reject_validation(state: PipelineState) -> dict:
     client_ref = state["client_ref"]
     attempt = state.get("attempt", 1)
     failed = state.get("failed_items", [])
-    reason = failed[0]["code"] if failed else "unknown"
+    codes = [f["code"] for f in failed]
+    non_retryable = next((c for c in codes if c in _NON_RETRYABLE_LLM_CODES), None)
+    if non_retryable:
+        # Инфраструктурный сбой (spec/03 §5): retry_gate был пропущен,
+        # попытки creator'а не расходовались — сообщение не должно
+        # утверждать "after N attempts", как при обычном content-retry.
+        reason_text = f"{non_retryable} (сбой инфраструктуры LLM, попытки creator'а не расходовались)"
+    else:
+        reason = codes[0] if codes else "unknown"
+        reason_text = f"{reason} after {MAX_ATTEMPTS} attempts"
     log = list(state.get("log", [])) + [
         make_event(
             "final", client_ref, attempt,
-            result="REJECT_VALIDATION", reason=f"{reason} after {MAX_ATTEMPTS} attempts",
+            result="REJECT_VALIDATION", reason=reason_text,
             total_attempts=attempt, total_llm_calls=state.get("llm_calls", 0),
             total_dur_ms=state.get("total_dur_ms", 0.0),
         )
@@ -365,9 +408,15 @@ def build_graph() -> StateGraph:
 
     g.add_edge(START, "prefilter")
     g.add_conditional_edges("prefilter", _prefilter_route, {"creator": "creator", END: END})
-    g.add_conditional_edges("creator", _creator_ok, {"format_check": "format_check", "retry_gate": "retry_gate"})
+    g.add_conditional_edges(
+        "creator", _creator_ok,
+        {"format_check": "format_check", "retry_gate": "retry_gate", "reject_validation": "reject_validation"},
+    )
     g.add_conditional_edges("format_check", _format_ok, {"validator": "validator_node", "retry_gate": "retry_gate"})
-    g.add_conditional_edges("validator_node", _validator_ok, {"postprocess": "postprocess", "retry_gate": "retry_gate"})
+    g.add_conditional_edges(
+        "validator_node", _validator_ok,
+        {"postprocess": "postprocess", "retry_gate": "retry_gate", "reject_validation": "reject_validation"},
+    )
     g.add_conditional_edges("postprocess", _post_ok, {"accept": "accept", "retry_gate": "retry_gate"})
     g.add_conditional_edges("retry_gate", _retry_to_creator, {"creator": "creator", "reject_validation": "reject_validation"})
     g.add_edge("accept", END)
